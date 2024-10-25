@@ -8,10 +8,11 @@ from nltk.tokenize import word_tokenize
 
 
 class VectorDataset:
-    def __init__(self, text_data, y, vectorizer):
+    def __init__(self, text_data, y, vectorizer, additional_data=None):
         self.text_data = text_data
         self.y = y
         self.vectorizer = vectorizer
+        self.additional_data = additional_data
 
     def __len__(self):
         return self.y.shape[0]
@@ -20,13 +21,25 @@ class VectorDataset:
         text = self.text_data[ind]
         text = [torch.tensor(self.vectorizer[word]) for word in word_tokenize(text) if word in self.vectorizer.key_to_index]
         if not text:
-            return torch.zeros((1, 300)), torch.tensor(self.y[ind])
-        return torch.stack(text, axis=0), torch.tensor(self.y[ind])
+            text = torch.zeros((1, 300))
+        else:
+            text = torch.stack(text, axis=0)
+        if self.additional_data is not None:
+            return text, self.additional_data[ind], torch.tensor(self.y[ind])
+        return text, torch.tensor(self.y[ind])
 
 def data_collator(batch: tuple):
     X = pad_sequence([sample[0] for sample in batch], batch_first=True, padding_side='left')
-    y = torch.stack([sample[1] for sample in batch], 0)
+    y = torch.stack([sample[-1] for sample in batch], 0)
+    
+    if len(batch[0]) == 3:
+        add_data = torch.stack([sample[1] for sample in batch], 0)
+        return X, add_data, y
+        
     return X, y
+
+def batch_to_device(batch: tuple, device):
+    return tuple(map(lambda x: x.to(device), batch))
 
 def train(model, epochs, optimizer, model_name, train_dataloader, val_dataloader, class_names, scheduler=None, device='cuda'):
     loss_fn = nn.CrossEntropyLoss()
@@ -37,9 +50,10 @@ def train(model, epochs, optimizer, model_name, train_dataloader, val_dataloader
         avg_loss = 0
         avg_f1 = 0
         model.train()
-        for train_iter, (X, y) in tqdm.tqdm(enumerate(train_dataloader), desc='Training'):
-            X, y = X.to(device), y.to(device)
-            logits = model(X)
+        for train_iter, batch in tqdm.tqdm(enumerate(train_dataloader), desc='Training'):
+            batch = batch_to_device(batch, device)
+            X, y = batch[:-1], batch[-1]
+            logits = model(*X)
             loss = loss_fn(logits, y)
             loss.backward()
 
@@ -53,16 +67,20 @@ def train(model, epochs, optimizer, model_name, train_dataloader, val_dataloader
         model.eval()
         
         all_preds = []
-        for val_iter, (X, y) in tqdm.tqdm(enumerate(val_dataloader), desc='Validation'):
-            X, y = X.to(device), y.to(device)
+        all_labels = []
+        for val_iter, batch in tqdm.tqdm(enumerate(val_dataloader), desc='Validation'):
+            batch = batch_to_device(batch, device)
+            X, y = batch[:-1], batch[-1]
             with torch.no_grad():
-                logits = model(X)
+                logits = model(*X)
                 
             preds = logits.argmax(-1)
             all_preds.append(preds)
+            all_labels.append(y)
             
         all_preds = torch.cat(all_preds)
-        f1 = f1_score(test_y, all_preds.cpu().numpy(), average='macro')
+        all_labels = torch.cat(all_labels)
+        f1 = f1_score(all_labels.cpu().numpy(), all_preds.cpu().numpy(), average='macro')
 
         losses.append(avg_loss / (train_iter + 1))
         f1_scores.append(f1)
@@ -83,4 +101,4 @@ def train(model, epochs, optimizer, model_name, train_dataloader, val_dataloader
     axes[1].set_xlabel('Epoch')
     axes[1].set_ylabel('Macro F1')
 
-    print(classification_report(test_y, best_preds, target_names=class_names))
+    print(classification_report(all_labels.cpu().numpy(), best_preds, target_names=class_names))
